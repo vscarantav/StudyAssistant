@@ -16,6 +16,9 @@ def when(value):
     return d.strftime('%b %d, %Y · %I:%M %p %Z') if d else 'No date provided'
 def source_links(plan,ids,prefix=''):
     return ' · '.join(link(prefix+'index.html#source-'+s.replace(':','-'), next((x['title'] for x in plan['sources'] if x['id']==s),s)) for s in list(dict.fromkeys(ids))[:8])
+def zero_points(value):
+    try:return value is not None and float(value)==0
+    except (TypeError,ValueError):return False
 
 def toolbar():
     return '''<div class="lp-toolbar"><div class="lp-links"><button class="lp-button secondary" data-export-progress>Export progress backup</button><label>Import progress backup <input type="file" accept=".json,application/json" data-import-progress></label></div><p class="lp-status" role="status" aria-live="polite" data-save-status>Loading progress…</p></div>'''
@@ -29,7 +32,10 @@ def control(item,concept=False):
     if concept:
         opts=''.join(f'<option value="{v}">{t}</option>' for v,t in [('not_started','Not started'),('learning','Learning'),('practiced','Practiced'),('mastered','Mastered (self-assessed)')])
         return f'<div class="lp-controls"><label>My understanding <select data-progress-id="{iid}" disabled>{opts}</select></label><label><input type="checkbox" data-review-id="{iid}" disabled> Needs review</label></div><label>My learning notes<textarea class="lp-notes" maxlength="5000" data-notes-id="{iid}" disabled></textarea></label>'
-    return f'<div class="lp-controls"><label><input type="checkbox" data-progress-id="{iid}" disabled> I completed this item</label></div>'
+    canvas_done=item.get('canvas_completed') is True
+    attrs=' data-canvas-completed="true" checked disabled' if canvas_done else ' disabled'
+    label='Completed in Canvas' if canvas_done else 'I completed this item'
+    return f'<div class="lp-controls"><label><input type="checkbox" data-progress-id="{iid}"{attrs}> {label}</label></div>'
 
 def manifest(plans):
     result={'schema_version':1,'courses':{}}
@@ -123,19 +129,48 @@ def lesson_page(p,c):
         task_html = '<h2>Apply it this week</h2><p>You will use this concept in the following assignments:</p>' + lis([link(r['url'], r['title']) + f' — {e(when(r["due_at"]))}' for r in sorted(tasks, key=lambda x: x['due_at'])[:5]])
     return f'''<p>{related}</p><section class="lp-card"><h2>The idea, simply</h2><p>{e(c['explanation'])}</p><p><strong>Your goal:</strong> {e(c['goal'])}</p></section><h2>A worked example</h2><p class="lp-muted">Original practice example with invented data; not a course assessment answer.</p><pre class="lp-example">{e(c['example'])}</pre><p class="lp-result">{e(c['result'])}</p><h2>A common mistake</h2><p class="lp-warning">{e(c['mistake'])}</p><section class="lp-card"><h2>Try it yourself</h2><p>{e(c['question'])}</p><details><summary>Show the explanation</summary><p>{e(c['answer'])}</p></details></section><section class="lp-card"><h2>Track your understanding</h2>{control(c,True)}{progress(p)}</section>{task_html}<h2>Read more and connect it to class</h2>{resource}<p class="lp-source">Course context: {source_links(p,c['source_ids'],'../')}</p><p>{link('../index.html#sources','All course sources')}</p>'''
 
-def report_fragment(p,week):
+def report_fragment(p,week,assignment_count=None):
+    """Render the compact lesson-plan preview used inside a report accordion."""
     cid=p['course_id'];w=p['weeks'][week-1]; base=f'course_plans/{cid}/'
     concepts=[next(c for c in p['concepts'] if c['key']==k) for k in w['concepts']]
-    rows=lis([link(base+f'concepts/{c["key"]}.html',c['title'])+' — '+e(c['hook']) for c in concepts]) if concepts else '<p>No scheduled concept lesson is documented for this week. See the full course roadmap.</p>'
-    milestones=[r for r in p['requirements'] if r['kind'] in ('assessment','project') and r['due_week'] and r['due_week']>=week and r['category']!='reference']
-    milestones.sort(key=lambda r:r['due_at'])
-    next_text=('<p><strong>Next exported milestone:</strong> '+link(milestones[0]['url'],milestones[0]['title'])+' — '+e(when(milestones[0]['due_at']))+'</p>') if milestones else ''
-    important=[f for f in p['facts'] if f['label'] in ('Proctorio','Testing center','Exam date conflict','Work-hour requirement')]
-    flags=''.join(f'<p class="lp-muted"><strong>{e(f["label"])}:</strong> {e(f["value"])}</p>' for f in important)
-    tasks = [r for r in p['requirements'] if r['category'] == 'personal' and week in r['learning_weeks']]
-    if tasks:
-        flags = '<h3>Your checklist this week</h3>' + ''.join(requirement(r) for r in tasks) + flags
-    return f'<div class="lp-panel"><h3>Your course plan & learning progress</h3><div class="lp-links">{link(base+"index.html","Full course plan")}{link(base+f"weeks/week-{week:02d}.html","This week’s plan")}</div>{progress(p)}<p class="lp-muted">Manual coursework completion and self-assessed concept mastery; all assigned exported items are counted in the course total.</p><h3>Concept lessons for this week</h3>{rows}{next_text}{flags}</div>'
+    week_ids=set(w['learning_ids']+w['due_ids'])
+    counted=[r for r in p['requirements'] if r['id'] in week_ids and r['category']=='assigned' and not zero_points(r.get('points'))]
+    assignment_count=len(counted) if assignment_count is None else assignment_count
+
+    concept_html=''
+    for index,c in enumerate(concepts,1):
+        example=c.get('example') or 'Open the full lesson for a worked example.'
+        if len(example)>520: example=example[:517].rsplit(' ',1)[0]+' …'
+        concept_html+=f'''<article class="lesson-concept">
+            <div class="lesson-concept-heading">
+                <span class="lesson-number">Concept {index:02d}</span>
+                {link(base+f'concepts/{c["key"]}.html',c['title'])}
+            </div>
+            <p class="lesson-hook">{e(c['hook'])}</p>
+            <details class="lesson-preview">
+                <summary>Preview explanation, example, and real-life use</summary>
+                <div class="lesson-preview-grid">
+                    <section><h5>In plain language</h5><p>{e(c['explanation'])}</p></section>
+                    <section><h5>Small example</h5><pre>{e(example)}</pre></section>
+                    <section><h5>Why it matters</h5><p>{e(c['result'])}</p></section>
+                </div>
+            </details>
+        </article>'''
+    if not concept_html:
+        concept_html='<p class="lesson-empty">No scheduled concept lesson is documented for this week. Open the full course plan for the semester roadmap.</p>'
+
+    return f'''<section class="report-lesson-plan" aria-label="Week {week} lesson plan">
+        <div class="course-utility-strip">
+            <a class="course-plan-link" href="{e(base+'index.html')}">Open {e(p['course_code'])} course page <span aria-hidden="true">↗</span></a>
+            <span><strong>{len(concepts)}</strong> concept{'s' if len(concepts)!=1 else ''}</span>
+            <a href="#course-{e(cid)}-assignments"><strong>{assignment_count}</strong> assignment{'s' if assignment_count!=1 else ''}</a>
+        </div>
+        <div class="lesson-plan-heading">
+            <div><span class="lesson-eyebrow">Full lesson plan</span><h3>{e(w['focus'])}</h3></div>
+            <a class="lesson-plan-button" href="{e(base+f'weeks/week-{week:02d}.html')}">Open week {week:02d} plan <span aria-hidden="true">→</span></a>
+        </div>
+        <div class="lesson-concepts">{concept_html}</div>
+    </section>'''
 
 def render_all(plans,output):
     output=Path(output);assets=output/'assets';assets.mkdir(parents=True,exist_ok=True)

@@ -19,8 +19,9 @@
  function refresh() {
   document.querySelectorAll('[data-progress-id]').forEach(el=>{
    const item=state.items[el.dataset.progressId] || {};
-   if(!busy){if(el.type==='checkbox') el.checked=item.status==='completed'; else el.value=item.status || 'not_started';}
-   el.disabled=!ready || busy;
+   const canvasCompleted=el.dataset.canvasCompleted==='true';
+   if(!busy){if(el.type==='checkbox') el.checked=canvasCompleted || item.status==='completed'; else el.value=item.status || 'not_started';}
+   el.disabled=canvasCompleted || !ready || busy;
   });
   document.querySelectorAll('[data-review-id]').forEach(el=>{ if(!busy)el.checked=!!state.items[el.dataset.reviewId]?.needs_review; el.disabled=!ready || busy; });
   document.querySelectorAll('[data-notes-id]').forEach(el=>{ if(document.activeElement!==el) el.value=state.items[el.dataset.notesId]?.notes || ''; el.disabled=!ready || busy; });
@@ -55,7 +56,7 @@
  }
  const detailsFor=id=>Object.values(manifest.courses).map(c=>c.items[id]).find(Boolean);
  document.addEventListener('change',e=>{
-  const el=e.target; const id=el.dataset.progressId || el.dataset.reviewId || el.dataset.notesId; if(!id)return;
+  const el=e.target; const id=el.dataset.progressId || el.dataset.reviewId || el.dataset.notesId; if(!id || el.dataset.canvasCompleted==='true')return;
   const prior=state.items[id] || {status:'not_started',source:'manual',term:'2026-fall'};
   const item={...prior,content_hash:detailsFor(id)?.hash || ''};
   if(el.dataset.progressId)item.status=el.type==='checkbox'?(el.checked?'completed':'not_started'):el.value;

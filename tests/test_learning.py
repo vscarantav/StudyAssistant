@@ -10,7 +10,7 @@ from datetime import datetime
 from course_plans.sources import eligible, date, week_of, schedule_rows, safe_url, ROOT
 from course_plans.progress import ProgressStore, validate
 from course_plans.curriculum import normalize, apply_overrides
-from course_plans.render import manifest
+from course_plans.render import control, manifest, report_fragment
 from generate_summary import extract_week_assignments
 
 class SourceTests(unittest.TestCase):
@@ -56,12 +56,61 @@ class ProgressTests(unittest.TestCase):
   self.assertEqual(self.path.read_text(),'broken')
 
 class FixtureTests(unittest.TestCase):
- def test_weekly_assignment_uses_ol_account_snapshot_url(self):
+ def test_weekly_assignment_preserves_its_source_url(self):
   assignment={'id':9,'course_id':1,'name':'W01 Example','published':True,'due_at':'2026-09-15T18:00:00Z','lock_at':'2026-09-17T18:00:00Z','assignment_group_id':3,'submission_types':['online_upload'],'html_url':'https://canvas.test/courses/1/assignments/9'}
   grouped,items=extract_week_assignments([assignment],[{'id':3,'name':'Homework'}],1,datetime(2026,9,12),datetime(2026,9,18))
   self.assertEqual(items[0]['url'],assignment['html_url'])
   self.assertEqual(items[0]['lock_at'],assignment['lock_at'])
   self.assertEqual(grouped['Homework'][0]['url'],assignment['html_url'])
+
+ def test_weekly_assignment_omits_zero_point_items(self):
+  assignments=[
+   {'id':9,'course_id':1,'name':'Graded work','published':True,'due_at':'2026-09-15T18:00:00Z','points_possible':5,'assignment_group_id':3,'submission_types':['online_upload']},
+   {'id':10,'course_id':1,'name':'Administrative placeholder','published':True,'due_at':'2026-09-15T18:00:00Z','points_possible':'0','assignment_group_id':3,'submission_types':['none']},
+  ]
+  grouped,items=extract_week_assignments(assignments,[{'id':3,'name':'Homework'}],1,datetime(2026,9,12),datetime(2026,9,18))
+  self.assertEqual([item['name'] for item in items],['Graded work'])
+  self.assertEqual(len(grouped['Homework']),1)
+
+ def test_weekly_assignments_are_ranked_by_points_times_group_weight(self):
+  assignments=[
+   {'id':1,'course_id':1,'name':'Many points, low weight','published':True,'due_at':'2026-09-15T18:00:00Z','points_possible':20,'assignment_group_id':1,'submission_types':[],'_group_weight':10},
+   {'id':2,'course_id':1,'name':'Fewer points, high weight','published':True,'due_at':'2026-09-16T18:00:00Z','points_possible':8,'assignment_group_id':2,'submission_types':[],'_group_weight':40},
+  ]
+  groups=[{'id':1,'name':'Practice'},{'id':2,'name':'Exams'}]
+  grouped,items=extract_week_assignments(assignments,groups,1,datetime(2026,9,12),datetime(2026,9,18))
+  self.assertEqual([item['name'] for item in items],['Fewer points, high weight','Many points, low weight'])
+  self.assertEqual(list(grouped),['Exams','Practice'])
+
+ def test_report_lesson_plan_is_compact_and_linked(self):
+  plan=json.loads((ROOT/'data/course_plans/431290.json').read_text())
+  html=report_fragment(plan,1,3)
+  self.assertIn('class="course-utility-strip"',html)
+  self.assertIn('class="report-lesson-plan"',html)
+  self.assertIn('Preview explanation, example, and real-life use',html)
+  self.assertIn('course_plans/431290/concepts/workflow.html',html)
+  self.assertIn('href="#course-431290-assignments"',html)
+  self.assertNotIn('data-course-progress',html)
+
+ def test_report_course_heading_shows_concept_count(self):
+  plan=json.loads((ROOT/'data/course_plans/431290.json').read_text())
+  courses=[{
+   'course_id':'431290','course_plan':plan,'course_name':plan['name'],
+   'course_code':plan['course_code'],'module_topic':'Setup Week',
+   'learning_items':[],'announcements':[],'grouped_assignments':{},
+   'all_assignments':[],'student_grade':None,
+  }]
+  from generate_summary import generate_html_report
+  html=generate_html_report(1,datetime(2026,9,12),datetime(2026,9,18),courses)
+  header=html.split('<summary class="course-header">',1)[1].split('</summary>',1)[0]
+  self.assertIn('<span class="stat-number">2</span>',header)
+  self.assertIn('<span class="stat-label">concepts</span>',header)
+
+ def test_canvas_completed_control_is_checked_and_locked(self):
+  html=control({'id':'canvas:1:assignment:2','canvas_completed':True})
+  self.assertIn('data-canvas-completed="true"',html)
+  self.assertIn('checked disabled',html)
+  self.assertIn('Completed in Canvas',html)
 
  def test_reviewed_override_preserves_export(self):
   plan={'requirements':[{'id':'canvas:1:assignment:2','due_at':'2026-04-01T00:00:00Z','notes':[]}], 'weeks':[{'number':1,'due_ids':[]},{'number':2,'due_ids':[]}], 'facts':[]}

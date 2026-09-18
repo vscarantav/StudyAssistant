@@ -9,6 +9,19 @@ file, then run:
 python3 student_canvas_flow.py
 ```
 
+To test only the Grades-page scraper, use:
+
+```sh
+python3 student_canvas_flow.py --grades-only --close-after-open
+```
+
+To refresh only the BA 300 and BA 315 source-of-truth class schedules from
+their landing pages, use:
+
+```sh
+python3 student_canvas_flow.py --class-prep-only --close-after-open
+```
+
 The script opens Chrome with a fresh, non-persistent browser context, enters
 the student credentials, and pauses for you to complete MFA. After Canvas
 redirects to its home page, it saves static copies of the six rendered course
@@ -17,10 +30,17 @@ course's Assignments, Grades, Pages, and Quizzes sections, and waits with the
 browser open for the next interactive steps. Saved HTML has scripts and
 CSRF/authenticity-token values removed. It also visits each course syllabus at
 `/assignments/syllabus` and saves it as `syllabus.html` beside the landing-page
-file. On each Grades page it captures the displayed Canvas total and letter
-grade into `grade.json`. After a complete run, the current local weekly report
-is regenerated and shows that value in each course header. The flow does not
-save cookies or submit coursework.
+file. On each Grades page it saves `grades.html`, captures the displayed Canvas
+total and letter grade into `grade.json`, and writes the student-visible
+assignment rows to `assignments_from_grades.json`. After a complete run, the
+current local weekly report is regenerated. Its assignment cards and Canvas
+links come only from this student-account scrape; OL_Account course exports may
+enrich matching rows with week/date metadata but cannot add report cards. If no
+completed scrape exists, the report asks for one instead of substituting
+OL_Account assignments. For BA 300 and BA 315, the landing-page schedule is
+stored in `class_preparation.json`; the report shows the applicable dates,
+preclass preparation, and in-class activities in a dedicated **Class
+Preparation** section. The flow does not save cookies or submit coursework.
 
 ## Open your learning dashboard
 

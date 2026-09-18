@@ -30,6 +30,7 @@ from email import encoders
 from html import escape
 from html.parser import HTMLParser
 from pathlib import Path
+from urllib.parse import urlsplit
 from course_plans.sources import date as course_date, eligible as course_eligible
 from course_plans.render import report_fragment, toolbar as learning_toolbar, control as learning_control
 
@@ -97,6 +98,61 @@ def load_latest_student_grades(root=STUDENT_CANVAS_HTML_DIR):
     return {}, None
 
 
+def load_latest_student_assignments(root=STUDENT_CANVAS_HTML_DIR):
+    """Load assignment rows only from the newest completed student Grades scrape."""
+    root = Path(root)
+    for manifest_path in sorted(root.glob("*/manifest.json"), reverse=True):
+        try:
+            payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+            courses = payload.get("courses", [])
+            if not isinstance(courses, list):
+                continue
+            assignments = {}
+            for course in courses:
+                course_id = str(course.get("course_id", ""))
+                captured = course.get("student_assignments")
+                if (
+                    course_id
+                    and isinstance(captured, dict)
+                    and captured.get("status") == "ok"
+                    and isinstance(captured.get("assignments"), list)
+                ):
+                    assignments[course_id] = captured
+            if assignments:
+                return assignments, manifest_path
+        except (OSError, ValueError, TypeError):
+            continue
+    return {}, None
+
+
+def load_latest_class_preparation(root=STUDENT_CANVAS_HTML_DIR):
+    """Load BA 300/315 preparation rows from the newest successful landing scrape."""
+    root = Path(root)
+    preparation = {}
+    newest_manifest = None
+    for manifest_path in sorted(root.glob("*/manifest.json"), reverse=True):
+        try:
+            payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+            for course in payload.get("courses", []):
+                course_id = str(course.get("course_id", ""))
+                captured = course.get("class_preparation")
+                if (
+                    course_id in {"420634", "420672"}
+                    and course_id not in preparation
+                    and isinstance(captured, dict)
+                    and captured.get("status") == "ok"
+                    and isinstance(captured.get("entries"), list)
+                ):
+                    preparation[course_id] = captured
+                    if newest_manifest is None:
+                        newest_manifest = manifest_path
+            if len(preparation) == 2:
+                break
+        except (OSError, ValueError, TypeError):
+            continue
+    return preparation, newest_manifest
+
+
 def student_grade_display(grade):
     """Format Canvas's displayed total without interpreting or calculating it."""
     if not isinstance(grade, dict):
@@ -108,6 +164,47 @@ def student_grade_display(grade):
     if letter:
         return f"{total} ({letter})"
     return str(total)
+
+
+def student_assignment_records(captured, exported_assignments, plan, course_id):
+    """Enrich student Grades-page rows for week matching without adding OL-only rows."""
+    exported = {str(item.get("id", "")): item for item in exported_assignments}
+    requirements = {
+        str(item.get("canvas_id", "")): item
+        for item in (plan or {}).get("requirements", [])
+        if item.get("canvas_id")
+    }
+    records = []
+    group_weights = (captured or {}).get("group_weights", {})
+    for item in (captured or {}).get("assignments", []):
+        canvas_id = str(item.get("canvas_id", ""))
+        if not canvas_id or not item.get("title") or not item.get("url"):
+            continue
+        exported_item = exported.get(canvas_id, {})
+        requirement = requirements.get(canvas_id, {})
+        points = item.get("points")
+        if points is None:
+            points = requirement.get("points", exported_item.get("points_possible"))
+        records.append({
+            "id": canvas_id,
+            "course_id": str(course_id),
+            "name": item["title"],
+            "published": True,
+            "due_at": item.get("due_at") or requirement.get("due_at") or exported_item.get("due_at"),
+            "lock_at": None,
+            "points_possible": points,
+            "assignment_group_id": exported_item.get("assignment_group_id"),
+            "submission_types": [],
+            "description": "",
+            "html_url": item["url"],
+            "_group_name": item.get("group_name", ""),
+            "_group_weight": group_weights.get(item.get("group_name", "")),
+            "_canvas_completed": item.get("completed") is True,
+            "_canvas_status": item.get("submission_status", ""),
+            "_plan_notes": requirement.get("notes", []),
+            "_student_grade_source": True,
+        })
+    return records
 
 
 class HTMLTextExtractor(HTMLParser):
@@ -390,6 +487,13 @@ def extract_week_assignments(assignments, assignment_groups, week_num, week_star
     for a in assignments:
         if not a.get("published", False) or not course_eligible(a):
             continue
+        # Zero-point placeholders and administrative check-ins are not useful
+        # in the learner's weekly action list or calendar.
+        try:
+            if a.get("points_possible") is not None and float(a["points_possible"]) == 0:
+                continue
+        except (TypeError, ValueError):
+            pass
         
         # Check by due date
         due_dt = parse_date(a.get("due_at"))
@@ -404,14 +508,16 @@ def extract_week_assignments(assignments, assignment_groups, week_num, week_star
         name_match = bool(week_prefix_pattern.match(name))
         
         if in_range or name_match or str(a.get("id")) in (mapped_assignment_ids or set()):
-            group_name = group_map.get(a.get("assignment_group_id"), "Other")
+            group_name = a.get("_group_name") or group_map.get(a.get("assignment_group_id"), "Other")
             if is_career_readiness_assignment(a, group_name):
                 continue
 
             assignment_id = str(a.get("id"))
             # Determine submission type label
             sub_types = a.get("submission_types", [])
-            if "online_quiz" in sub_types:
+            if a.get("_student_grade_source"):
+                type_badge = "Canvas Item"
+            elif "online_quiz" in sub_types:
                 type_badge = "Quiz"
             elif "external_tool" in sub_types:
                 type_badge = "External Tool"
@@ -438,14 +544,24 @@ def extract_week_assignments(assignments, assignment_groups, week_num, week_star
                 "lock_at": a.get("lock_at"),
                 "points": a.get("points_possible"),
                 "group_name": group_name,
+                "group_weight": a.get("_group_weight"),
+                "canvas_completed": a.get("_canvas_completed") is True,
+                "canvas_status": a.get("_canvas_status", ""),
                 "type_badge": type_badge,
                 "description": desc_text,
                 "ai_context": truncate(full_description, 900),
                 "url": a.get("html_url", ""),
             })
     
-    # Sort by due date (None last)
-    week_assignments.sort(key=lambda x: (x["due_dt"] or datetime.max))
+    # Canvas does not expose the final denominator here, so points × group
+    # weight is a relevance ranking rather than an official grade calculation.
+    def relevance(item):
+        try: points=float(item.get("points") or 0)
+        except (TypeError,ValueError): points=0
+        try: weight=float(item.get("group_weight") or 0)
+        except (TypeError,ValueError): weight=0
+        return (-(points*weight),-weight,-points,item["due_dt"] or datetime.max,item["name"].casefold())
+    week_assignments.sort(key=relevance)
     
     # Group by assignment group
     grouped = {}
@@ -548,6 +664,150 @@ def format_short_date(date_str):
     return dt_mt.strftime("%a %b %d, %I:%M %p")
 
 
+def render_class_preparation(captured, week_start, week_end, show_missing=False):
+    """Render the relevant BA 300/315 landing-page schedule rows."""
+    if not isinstance(captured, dict) or captured.get("status") != "ok":
+        if not show_missing:
+            return ""
+        return """
+        <div class="section-card class-preparation-section source-missing">
+            <h3 class="section-title"><span class="section-icon">🏫</span> Class Preparation</h3>
+            <p class="class-prep-empty">The secondary account has not captured this course’s landing-page schedule yet.</p>
+        </div>"""
+
+    dated_entries = []
+    for entry in captured.get("entries", []):
+        try:
+            entry_date = datetime.strptime(str(entry.get("date", "")), "%Y-%m-%d")
+        except (TypeError, ValueError):
+            continue
+        dated_entries.append((entry_date, entry))
+    dated_entries.sort(key=lambda pair: pair[0])
+
+    selected = [
+        pair for pair in dated_entries
+        if week_start.date() <= pair[0].date() <= week_end.date()
+    ]
+    selection_label = "This report week"
+    if not selected:
+        future = [pair for pair in dated_entries if pair[0].date() > week_end.date()]
+        selected = future[:1]
+        selection_label = "Next scheduled class"
+
+    source_url = str(captured.get("source_url", ""))
+    source_parts = urlsplit(source_url)
+    source_link = ""
+    if source_parts.scheme in {"http", "https"} and source_parts.netloc and not source_parts.username:
+        clean_source = source_parts._replace(query="", fragment="").geturl()
+        source_link = (
+            f'<a class="class-prep-source" href="{escape(clean_source, quote=True)}" '
+            'target="_blank" rel="noopener noreferrer">View course landing page ↗</a>'
+        )
+
+    def cell_html(cell, empty_text):
+        cell = cell if isinstance(cell, dict) else {}
+        valid_links = []
+        seen_urls = set()
+        for link in cell.get("links", []):
+            if not isinstance(link, dict):
+                continue
+            url = str(link.get("url", ""))
+            parts = urlsplit(url)
+            if (
+                parts.scheme not in {"http", "https"}
+                or not parts.netloc
+                or parts.username
+                or url in seen_urls
+            ):
+                continue
+            seen_urls.add(url)
+            valid_links.append({
+                "title": str(link.get("title", "")).strip() or "Open resource",
+                "url": url,
+            })
+        lines = []
+        seen = set()
+        for value in cell.get("lines", []):
+            line = str(value).strip()
+            key = line.casefold()
+            if line and key not in seen:
+                seen.add(key)
+                lines.append(line)
+        if not lines and str(cell.get("text", "")).strip():
+            lines.append(str(cell["text"]).strip())
+        used_urls = set()
+        line_items = []
+        for line in lines:
+            exact_link = next(
+                (link for link in valid_links if link["title"].casefold() == line.casefold()),
+                None,
+            )
+            if exact_link:
+                used_urls.add(exact_link["url"])
+                line_items.append(
+                    f'<li><a href="{escape(exact_link["url"], quote=True)}" '
+                    f'target="_blank" rel="noopener noreferrer">{escape(line)} ↗</a></li>'
+                )
+            else:
+                line_items.append(f"<li>{escape(line)}</li>")
+        list_html = (
+            '<ul class="class-prep-list">'
+            + "".join(line_items)
+            + "</ul>"
+            if line_items else ""
+        )
+        links = []
+        for link in valid_links:
+            if link["url"] in used_urls:
+                continue
+            links.append(
+                f'<a href="{escape(link["url"], quote=True)}" target="_blank" '
+                f'rel="noopener noreferrer">{escape(link["title"])} ↗</a>'
+            )
+        links_html = (
+            f'<div class="class-prep-links">{"".join(links)}</div>' if links else ""
+        )
+        if not list_html and not links_html:
+            return f'<p class="class-prep-empty">{escape(empty_text)}</p>'
+        return list_html + links_html
+
+    cards = []
+    for entry_date, entry in selected:
+        before_html = cell_html(entry.get("before_class"), "No preparation listed.")
+        in_class_html = cell_html(entry.get("in_class"), "No in-class activity listed.")
+        cards.append(f"""
+        <article class="class-prep-card">
+            <header class="class-prep-date">
+                <span>{escape(entry_date.strftime('%A'))}</span>
+                <time datetime="{escape(entry_date.date().isoformat(), quote=True)}">{escape(entry_date.strftime('%B %d').replace(' 0', ' '))}</time>
+            </header>
+            <div class="class-prep-columns">
+                <section>
+                    <h4>Before class</h4>
+                    {before_html}
+                </section>
+                <section>
+                    <h4>In class</h4>
+                    {in_class_html}
+                </section>
+            </div>
+        </article>""")
+
+    if not cards:
+        cards.append(
+            '<p class="class-prep-empty">No upcoming class-preparation rows were found on the landing page.</p>'
+        )
+    return f"""
+    <div class="section-card class-preparation-section">
+        <div class="class-prep-heading">
+            <h3 class="section-title"><span class="section-icon">🏫</span> Class Preparation</h3>
+            {source_link}
+        </div>
+        <p class="section-intro">{escape(selection_label)} · Source of truth: course landing page</p>
+        <div class="class-prep-cards">{"".join(cards)}</div>
+    </div>"""
+
+
 def generate_html_report(week_num, week_start, week_end, courses_data, ai_summaries=None):
     """Generate a polished, self-contained HTML report."""
     ai_summaries = ai_summaries or {}
@@ -611,7 +871,16 @@ def generate_html_report(week_num, week_start, week_end, courses_data, ai_summar
             </div>"""
 
         if cd.get("course_plan"):
-            learning_html = report_fragment(cd["course_plan"], week_num)
+            learning_html = report_fragment(
+                cd["course_plan"], week_num, len(cd["all_assignments"])
+            )
+
+        class_preparation_html = render_class_preparation(
+            cd.get("class_preparation"),
+            week_start,
+            week_end,
+            show_missing=ccode in {"BA 300", "BA 315"},
+        )
 
         # Professor announcements
         announcements_html = ""
@@ -639,12 +908,13 @@ def generate_html_report(week_num, week_start, week_end, courses_data, ai_summar
                 </article>"""
 
             announcements_html = f"""
-            <div class="section-card announcements-section">
-                <h3 class="section-title">
-                    <span class="section-icon">📢</span> Professor Announcements
-                </h3>
+            <details class="section-card announcements-section">
+                <summary class="section-title">
+                    <span><span class="section-icon">📢</span> Professor Announcements</span>
+                    <span class="announcement-count">{len(cd["announcements"])}</span>
+                </summary>
                 <div class="announcement-list">{announcement_cards}</div>
-            </div>"""
+            </details>"""
         
         # Homework section
         homework_html = ""
@@ -659,25 +929,35 @@ def generate_html_report(week_num, week_start, week_end, courses_data, ai_summar
                         if a.get("lock_at")
                         else "Not set in Canvas"
                     )
-                    points_html = f'<span class="points-badge">{a["points"]} pts</span>' if a["points"] else ""
+                    points_html = f'<span class="points-badge">{escape(str(a["points"]))} pts</span>' if a["points"] else ""
+                    weight = a.get("group_weight")
+                    weight_html = (
+                        f'<span class="weight-badge">{escape(f"{float(weight):g}")}% weight</span>'
+                        if weight is not None else ""
+                    )
                     type_class = a["type_badge"].lower().replace(" ", "-")
-                    desc_html = f'<p class="hw-description">{a["description"]}</p>' if a["description"] else ""
-                    # Assignment URLs come directly from the OL_Account snapshot.
+                    desc_html = f'<p class="hw-description">{escape(a["description"])}</p>' if a["description"] else ""
+                    # Assignment URLs come from the other account's Grades-page scrape.
                     assignment_url = a.get("url", "")
                     open_link_html = (
                         f'<a class="canvas-link" href="{escape(assignment_url, quote=True)}" '
                         'target="_blank" rel="noopener noreferrer">Open in Canvas <span aria-hidden="true">↗</span></a>'
                         if assignment_url else ""
                     )
-                    saved_control = learning_control({"id": f'canvas:{cd.get("course_id")}:{"assignment"}:{a.get("canvas_id")}'}) if cd.get("course_plan") and a.get("canvas_id") else ""
+                    progress_id = f'canvas:{cd.get("course_id")}:assignment:{a.get("canvas_id")}'
+                    saved_control = learning_control({
+                        "id": progress_id,
+                        "canvas_completed": a.get("canvas_completed") is True,
+                    }) if cd.get("course_plan") and a.get("canvas_id") else ""
                     plan_notes_html = ''.join(f'<p class="lp-warning">{escape(note)}</p>' for note in a.get("plan_notes", []))
                     
                     items_html += f"""
-                    <div class="hw-card">
+                    <div class="hw-card{' canvas-completed' if a.get('canvas_completed') else ''}">
                         <div class="hw-header">
-                            <h5 class="hw-name">{a['name']}</h5>
+                            <h5 class="hw-name">{escape(a['name'])}</h5>
                             <div class="hw-badges">
-                                <span class="type-badge type-{type_class}">{a['type_badge']}</span>
+                                <span class="type-badge type-{escape(type_class, quote=True)}">{escape(a['type_badge'])}</span>
+                                {weight_html}
                                 {points_html}
                             </div>
                         </div>
@@ -699,27 +979,39 @@ def generate_html_report(week_num, week_start, week_end, courses_data, ai_summar
                 
                 groups_html += f"""
                 <div class="hw-group">
-                    <h4 class="group-title">{group_name} <span class="group-count">{len(items)}</span></h4>
+                    <h4 class="group-title">{escape(group_name)} <span class="group-count">{len(items)}</span></h4>
                     {items_html}
                 </div>"""
             
             homework_html = f"""
-            <div class="section-card">
+            <div class="section-card assignments-section" id="course-{escape(str(cd.get('course_id')), quote=True)}-assignments">
                 <h3 class="section-title">
-                    <span class="section-icon">✏️</span> Homework Due This Week
+                    <span class="section-icon">✓</span> Assignments This Week
                 </h3>
+                <p class="section-intro">Ordered by approximate grade impact (points × assignment-group weight). Zero-point items are hidden.</p>
                 {groups_html}
             </div>"""
-        else:
-            homework_html = """
-            <div class="section-card">
+        elif not cd.get("assignment_source_available", True):
+            homework_html = f"""
+            <div class="section-card assignment-source-missing" id="course-{escape(str(cd.get('course_id')), quote=True)}-assignments">
                 <h3 class="section-title">
-                    <span class="section-icon">🎉</span> No Homework This Week
+                    <span class="section-icon">↻</span> Student Assignment Scrape Needed
                 </h3>
-                <p style="color: #94a3b8; padding: 1rem;">Enjoy the break!</p>
+                <p>The other account’s Grades page has not been captured yet. Run <code>python3 student_canvas_flow.py</code>; this report will not substitute OL_Account assignments.</p>
+            </div>"""
+        else:
+            homework_html = f"""
+            <div class="section-card" id="course-{escape(str(cd.get('course_id')), quote=True)}-assignments">
+                <h3 class="section-title">
+                    <span class="section-icon">✓</span> No Assignments This Week
+                </h3>
+                <p style="color: #94a3b8; padding: 1rem;">No graded assignments are mapped to this week.</p>
             </div>"""
         
         assignment_count = len(cd["all_assignments"])
+        concept_count = 0
+        if cd.get("course_plan"):
+            concept_count = len(cd["course_plan"]["weeks"][week_num - 1]["concepts"])
         for assignment in cd["all_assignments"]:
             calendar_assignments.append({
                 **assignment,
@@ -738,6 +1030,10 @@ def generate_html_report(week_num, week_start, week_end, courses_data, ai_summar
                 <div class="course-stats">
                     {grade_stat_html}
                     <div class="stat">
+                        <span class="stat-number">{concept_count}</span>
+                        <span class="stat-label">concepts</span>
+                    </div>
+                    <div class="stat">
                         <span class="stat-number">{assignment_count}</span>
                         <span class="stat-label">assignments</span>
                     </div>
@@ -746,8 +1042,9 @@ def generate_html_report(week_num, week_start, week_end, courses_data, ai_summar
             </summary>
             <div class="course-body">
                 {learning_html}
-                {announcements_html}
+                {class_preparation_html}
                 {homework_html}
+                {announcements_html}
             </div>
         </details>
         """
@@ -795,7 +1092,7 @@ def generate_html_report(week_num, week_start, week_end, courses_data, ai_summar
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Week {week_num:02d} Summary — {week_start_str} – {week_end_str}</title>
+    <title>Study Assistant Lesson Plan · Week {week_num:02d}</title>
     <style>
         @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap');
 
@@ -1303,6 +1600,189 @@ def generate_html_report(week_num, week_start, week_end, courses_data, ai_summar
             margin-top: 0.3rem;
         }}
 
+        /* ---- Compact lesson plan ---- */
+        .report-lesson-plan {{
+            border-top: 1px solid #334155;
+            background: #172033;
+        }}
+
+        .course-utility-strip {{
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+            padding: 0.7rem 1.35rem;
+            border-bottom: 1px solid #334155;
+            background: #0f172a;
+            color: #94a3b8;
+            font-size: 0.75rem;
+        }}
+
+        .course-utility-strip a {{
+            color: #cbd5e1;
+            text-decoration: none;
+        }}
+
+        .course-utility-strip a:hover {{
+            color: #fff;
+            text-decoration: underline;
+        }}
+
+        .course-plan-link {{
+            margin-right: auto;
+            color: var(--course-primary) !important;
+            font-weight: 750;
+        }}
+
+        .course-utility-strip > span,
+        .course-utility-strip > a:not(.course-plan-link) {{
+            padding: 0.25rem 0.55rem;
+            border: 1px solid #334155;
+            border-radius: 999px;
+            white-space: nowrap;
+        }}
+
+        .course-utility-strip strong {{
+            color: #f8fafc;
+        }}
+
+        .lesson-plan-heading {{
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 1rem;
+            padding: 1.25rem 1.35rem 0.85rem;
+        }}
+
+        .lesson-eyebrow {{
+            display: block;
+            color: var(--course-primary);
+            font-size: 0.65rem;
+            font-weight: 800;
+            letter-spacing: 0.11em;
+            text-transform: uppercase;
+        }}
+
+        .lesson-plan-heading h3 {{
+            margin-top: 0.15rem;
+            color: #f8fafc;
+            font-size: 1.08rem;
+        }}
+
+        .lesson-plan-button {{
+            flex: 0 0 auto;
+            padding: 0.5rem 0.75rem;
+            border: 1px solid color-mix(in srgb, var(--course-primary), white 15%);
+            border-radius: 0.6rem;
+            color: #f8fafc;
+            font-size: 0.76rem;
+            font-weight: 750;
+            text-decoration: none;
+        }}
+
+        .lesson-plan-button:hover {{
+            background: var(--course-primary);
+        }}
+
+        .lesson-concepts {{
+            display: grid;
+            gap: 0.55rem;
+            padding: 0 1.35rem 1.25rem;
+        }}
+
+        .lesson-concept {{
+            padding: 0.8rem 0.9rem;
+            border: 1px solid #334155;
+            border-left: 3px solid var(--course-primary);
+            border-radius: 0.75rem;
+            background: #0f172a;
+        }}
+
+        .lesson-concept-heading {{
+            display: flex;
+            align-items: baseline;
+            gap: 0.65rem;
+        }}
+
+        .lesson-concept-heading a {{
+            color: #f8fafc;
+            font-size: 0.9rem;
+            font-weight: 750;
+            text-decoration: none;
+        }}
+
+        .lesson-concept-heading a:hover {{
+            color: var(--course-primary);
+            text-decoration: underline;
+        }}
+
+        .lesson-number {{
+            flex: 0 0 auto;
+            color: var(--course-primary);
+            font-size: 0.59rem;
+            font-weight: 800;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+        }}
+
+        .lesson-hook {{
+            margin: 0.18rem 0 0 4.8rem;
+            color: #94a3b8;
+            font-size: 0.78rem;
+        }}
+
+        .lesson-preview {{
+            margin: 0.55rem 0 0 4.8rem;
+            color: #cbd5e1;
+            font-size: 0.78rem;
+        }}
+
+        .lesson-preview > summary {{
+            color: #94a3b8;
+            cursor: pointer;
+            font-weight: 650;
+        }}
+
+        .lesson-preview > summary:hover {{
+            color: #e2e8f0;
+        }}
+
+        .lesson-preview-grid {{
+            display: grid;
+            grid-template-columns: repeat(3, minmax(0, 1fr));
+            gap: 0.65rem;
+            margin-top: 0.65rem;
+        }}
+
+        .lesson-preview-grid section {{
+            min-width: 0;
+            padding: 0.7rem;
+            border-radius: 0.55rem;
+            background: #172033;
+        }}
+
+        .lesson-preview-grid h5 {{
+            margin-bottom: 0.3rem;
+            color: var(--course-primary);
+            font-size: 0.68rem;
+            text-transform: uppercase;
+            letter-spacing: 0.04em;
+        }}
+
+        .lesson-preview-grid p,
+        .lesson-preview-grid pre {{
+            color: #cbd5e1;
+            font: inherit;
+            line-height: 1.5;
+            white-space: pre-wrap;
+            overflow-wrap: anywhere;
+        }}
+
+        .lesson-empty {{
+            padding: 0.8rem;
+            color: #94a3b8;
+            font-size: 0.82rem;
+        }}
+
         /* ---- Section Cards ---- */
         .section-card {{
             padding: 1.5rem 2rem;
@@ -1319,8 +1799,180 @@ def generate_html_report(week_num, week_start, week_end, courses_data, ai_summar
             gap: 0.5rem;
         }}
 
+        .announcements-section > summary.section-title {{
+            justify-content: space-between;
+            margin-bottom: 0;
+            cursor: pointer;
+            list-style: none;
+        }}
+
+        .announcements-section > summary::-webkit-details-marker {{
+            display: none;
+        }}
+
+        .announcements-section[open] > summary.section-title {{
+            margin-bottom: 1.25rem;
+        }}
+
+        .announcement-count {{
+            display: inline-grid;
+            place-items: center;
+            min-width: 1.65rem;
+            height: 1.65rem;
+            padding: 0 0.4rem;
+            border-radius: 999px;
+            background: #0f172a;
+            color: #94a3b8;
+            font-size: 0.72rem;
+        }}
+
+        .section-intro {{
+            margin: -0.7rem 0 1.1rem;
+            color: #94a3b8;
+            font-size: 0.78rem;
+        }}
+
+        .assignments-section {{
+            scroll-margin-top: 1rem;
+        }}
+
         .section-icon {{
             font-size: 1.2rem;
+        }}
+
+        /* ---- BA 300 / BA 315 class preparation ---- */
+        .class-preparation-section {{
+            background: #172033;
+        }}
+
+        .class-prep-heading {{
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 1rem;
+        }}
+
+        .class-prep-heading .section-title {{
+            margin-bottom: 1.25rem;
+        }}
+
+        .class-prep-source {{
+            margin-bottom: 1.25rem;
+            color: var(--course-primary);
+            font-size: 0.76rem;
+            font-weight: 750;
+            text-decoration: none;
+        }}
+
+        .class-prep-source:hover {{
+            text-decoration: underline;
+        }}
+
+        .class-prep-cards {{
+            display: grid;
+            gap: 0.75rem;
+        }}
+
+        .class-prep-card {{
+            display: grid;
+            grid-template-columns: 9rem minmax(0, 1fr);
+            border: 1px solid #334155;
+            border-left: 3px solid var(--course-primary);
+            border-radius: 0.8rem;
+            background: #0f172a;
+            overflow: hidden;
+        }}
+
+        .class-prep-date {{
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            gap: 0.15rem;
+            padding: 1rem;
+            border-right: 1px solid #334155;
+        }}
+
+        .class-prep-date span {{
+            color: var(--course-primary);
+            font-size: 0.68rem;
+            font-weight: 800;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+        }}
+
+        .class-prep-date time {{
+            color: #f8fafc;
+            font-size: 0.92rem;
+            font-weight: 750;
+        }}
+
+        .class-prep-columns {{
+            display: grid;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+        }}
+
+        .class-prep-columns section {{
+            min-width: 0;
+            padding: 0.9rem 1rem;
+        }}
+
+        .class-prep-columns section + section {{
+            border-left: 1px solid #334155;
+        }}
+
+        .class-prep-columns h4 {{
+            margin-bottom: 0.45rem;
+            color: #e2e8f0;
+            font-size: 0.74rem;
+            letter-spacing: 0.04em;
+            text-transform: uppercase;
+        }}
+
+        .class-prep-list {{
+            padding-left: 1.1rem;
+            color: #cbd5e1;
+            font-size: 0.8rem;
+            line-height: 1.5;
+        }}
+
+        .class-prep-list li + li {{
+            margin-top: 0.25rem;
+        }}
+
+        .class-prep-list a {{
+            color: #93c5fd;
+            text-decoration: none;
+        }}
+
+        .class-prep-list a:hover {{
+            color: #dbeafe;
+            text-decoration: underline;
+        }}
+
+        .class-prep-links {{
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.35rem;
+            margin-top: 0.65rem;
+        }}
+
+        .class-prep-links a {{
+            padding: 0.25rem 0.45rem;
+            border: 1px solid #334155;
+            border-radius: 0.4rem;
+            color: #93c5fd;
+            font-size: 0.7rem;
+            text-decoration: none;
+        }}
+
+        .class-prep-links a:hover {{
+            border-color: #60a5fa;
+            color: #dbeafe;
+        }}
+
+        .class-prep-empty {{
+            color: #94a3b8;
+            font-size: 0.8rem;
         }}
 
         /* ---- Weekly Concepts ---- */
@@ -1436,6 +2088,16 @@ def generate_html_report(week_num, week_start, week_end, courses_data, ai_summar
             transform: translateY(-1px);
         }}
 
+        .hw-card.canvas-completed {{
+            border-color: #166534;
+            box-shadow: inset 3px 0 0 #22c55e;
+        }}
+
+        .hw-card.canvas-completed .lp-controls label {{
+            color: #86efac;
+            font-weight: 700;
+        }}
+
         .hw-header {{
             display: flex;
             justify-content: space-between;
@@ -1497,14 +2159,36 @@ def generate_html_report(week_num, week_start, week_end, courses_data, ai_summar
             color: #d1d5db;
         }}
 
-        .points-badge {{
+        .type-canvas-item {{
+            background: #1e3a5f;
+            color: #7dd3fc;
+        }}
+
+        .assignment-source-missing p {{
+            color: #94a3b8;
+            font-size: 0.85rem;
+        }}
+
+        .assignment-source-missing code {{
+            color: #c4b5fd;
+        }}
+
+        .points-badge,
+        .weight-badge {{
             background: #1e293b;
-            color: #fbbf24;
             padding: 0.2rem 0.6rem;
             border-radius: 1rem;
             font-size: 0.7rem;
             font-weight: 600;
             border: 1px solid #374151;
+        }}
+
+        .points-badge {{
+            color: #fbbf24;
+        }}
+
+        .weight-badge {{
+            color: #c4b5fd;
         }}
 
         .hw-due {{
@@ -1608,6 +2292,53 @@ def generate_html_report(week_num, week_start, week_end, courses_data, ai_summar
             .course-name {{
                 font-size: 0.78rem;
             }}
+            .course-utility-strip {{
+                align-items: flex-start;
+                flex-wrap: wrap;
+                padding: 0.7rem 1rem;
+            }}
+            .course-plan-link {{
+                flex-basis: 100%;
+            }}
+            .lesson-plan-heading {{
+                align-items: flex-start;
+                flex-direction: column;
+                padding: 1rem 1rem 0.75rem;
+            }}
+            .lesson-concepts {{
+                padding: 0 1rem 1rem;
+            }}
+            .lesson-concept-heading {{
+                align-items: flex-start;
+                flex-direction: column;
+                gap: 0.15rem;
+            }}
+            .lesson-hook,
+            .lesson-preview {{
+                margin-left: 0;
+            }}
+            .class-prep-heading {{
+                align-items: flex-start;
+                flex-direction: column;
+                gap: 0;
+            }}
+            .class-prep-card {{
+                grid-template-columns: 1fr;
+            }}
+            .class-prep-date {{
+                border-right: 0;
+                border-bottom: 1px solid #334155;
+            }}
+            .class-prep-columns {{
+                grid-template-columns: 1fr;
+            }}
+            .class-prep-columns section + section {{
+                border-top: 1px solid #334155;
+                border-left: 0;
+            }}
+            .lesson-preview-grid {{
+                grid-template-columns: 1fr;
+            }}
             .hw-header {{
                 flex-direction: column;
                 gap: 0.5rem;
@@ -1619,9 +2350,9 @@ def generate_html_report(week_num, week_start, week_end, courses_data, ai_summar
     <div class="container">
         <div class="hero">
             <div class="hero-content">
-                <span class="hero-label">Weekly Summary</span>
+                <span class="hero-label">Study Assistant</span>
                 <div class="hero-period">
-                    <h1>Week {week_num:02d}</h1>
+                    <h1>Lesson Plan · Week {week_num:02d}</h1>
                     <p class="hero-dates">{week_start_str} – {week_end_str}</p>
                 </div>
                 <div class="hero-stats">
@@ -1901,7 +2632,7 @@ def main():
     from build_course_plans import build as build_learning_plans
     course_plans = {p["course_id"]: p for p in build_learning_plans(snapshot_dir, OUTPUT_DIR)}
 
-    print("🔗 Using Canvas assignment links from the OL_Account snapshot")
+    print("🔗 Using OL_Account content for lessons; assignment cards require the student Grades-page scrape")
     
     # Step 3: Determine current week
     week_num = get_current_week_number(args.week)
@@ -1911,10 +2642,26 @@ def main():
     # Step 4: Process each course
     courses_data = []
     student_grades, student_grade_manifest = load_latest_student_grades()
+    student_assignments, student_assignment_manifest = load_latest_student_assignments()
+    class_preparation, class_preparation_manifest = load_latest_class_preparation()
     if student_grade_manifest:
         print(f"🎓 Using student grades from: {student_grade_manifest.parent.name}")
     else:
         print("🎓 No completed student grade capture is available")
+    if student_assignment_manifest:
+        print(
+            "📋 Using student Grades-page assignments from: "
+            f"{student_assignment_manifest.parent.name}"
+        )
+    else:
+        print("📋 No completed student Grades-page assignment scrape is available")
+    if class_preparation_manifest:
+        print(
+            "🏫 Using landing-page class preparation from: "
+            f"{class_preparation_manifest.parent.name}"
+        )
+    else:
+        print("🏫 No completed BA 300/315 class-preparation scrape is available")
     
     for course_id in COURSE_IDS:
         print(f"\n{'─' * 50}")
@@ -1923,6 +2670,17 @@ def main():
             plan = course_plans.get(course_id)
             if plan:
                 print(f"⚠️  {plan['course_code']}: no Canvas export; including source-gap plan")
+                captured = student_assignments.get(course_id)
+                records = student_assignment_records(captured, [], plan, course_id)
+                mapped_ids = {
+                    str(r.get("canvas_id"))
+                    for r in plan["requirements"]
+                    if week_num in r["learning_weeks"] or r["due_week"] == week_num
+                }
+                grouped_assignments, all_assignments = extract_week_assignments(
+                    records, [], week_num, week_start, week_end,
+                    mapped_assignment_ids=mapped_ids,
+                ) if captured else ({}, [])
                 courses_data.append({
                     "course_id": course_id,
                     "course_plan": plan,
@@ -1931,8 +2689,10 @@ def main():
                     "module_topic": "",
                     "learning_items": [],
                     "announcements": [],
-                    "grouped_assignments": {},
-                    "all_assignments": [],
+                    "grouped_assignments": grouped_assignments,
+                    "all_assignments": all_assignments,
+                    "assignment_source_available": captured is not None,
+                    "class_preparation": class_preparation.get(course_id),
                     "student_grade": student_grades.get(course_id),
                 })
             continue
@@ -1978,15 +2738,24 @@ def main():
         )
         print(f"  📢 Professor announcements: {len(announcements)}")
         
-        # Extract assignments
-        grouped_assignments, all_assignments = extract_week_assignments(
-            data["assignments"],
-            data["assignment_groups"],
-            week_num,
-            week_start,
-            week_end,
-            mapped_assignment_ids=mapped_ids,
-        )
+        # The report's actionable assignment list comes only from the other
+        # account's student Grades-page scrape. OL data may enrich matching
+        # rows with scheduling metadata, but it never contributes extra rows.
+        captured = student_assignments.get(course_id)
+        if captured is not None:
+            assignment_records = student_assignment_records(
+                captured, data["assignments"], plan, course_id
+            )
+            grouped_assignments, all_assignments = extract_week_assignments(
+                assignment_records,
+                data["assignment_groups"],
+                week_num,
+                week_start,
+                week_end,
+                mapped_assignment_ids=mapped_ids,
+            )
+        else:
+            grouped_assignments, all_assignments = {}, []
         
         print(f"  ✏️  Assignments: {len(all_assignments)}")
         for group_name, items in grouped_assignments.items():
@@ -2002,6 +2771,8 @@ def main():
             "announcements": announcements,
             "grouped_assignments": grouped_assignments,
             "all_assignments": all_assignments,
+            "assignment_source_available": captured is not None,
+            "class_preparation": class_preparation.get(course_id),
             "student_grade": student_grades.get(course_id),
         })
     

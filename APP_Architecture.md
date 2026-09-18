@@ -2,7 +2,7 @@
 
 ## 1. Purpose and scope
 
-Homework Assistant is a local-first Python application that turns Canvas course exports fetched through the single OL_Account identity into an offline learning site and weekly homework reports. It combines source-backed course plans, weekly roadmaps, concept lessons, OL_Account assignment links, announcements, manual progress tracking, portable ZIP packages, and optional email delivery.
+Homework Assistant is a local-first Python application that turns Canvas course exports into an offline learning site and weekly homework reports. OL_Account exports supply course content, schedules, announcements, and lesson evidence. A separate student-account browser scrape supplies the assignment rows and links shown in weekly report containers. The application combines these with source-backed course plans, weekly roadmaps, concept lessons, manual progress tracking, portable ZIP packages, and optional email delivery.
 
 This document is the behavioral and technical contract for the repository as implemented. It distinguishes current behavior from limitations and intentionally unsupported behavior. The application is configured for the Fall 2026 BYU-Idaho term and six learning-dashboard courses:
 
@@ -146,7 +146,7 @@ Successful data is saved under a timestamped snapshot directory. Each course rec
 
 The login redirect guard prevents a completed local Canvas login from being handed unexpectedly into SAML. Calling `fetch_course.py --anonymous` uses a fresh OL_Account browser context without loading or saving cookies; the orchestrator exposes this as `generate_summary.py --anonymous-ol-account`.
 
-This is the application's only Canvas account flow. Course content, announcements, and assignment URLs all come from the resulting OL_Account snapshot. The application has no second-account login, identity comparison, alternate assignment lookup, URL-mapping cache, dedicated Chrome profile, or account-specific report opener.
+OL_Account remains the course-content acquisition flow. The separate `student_canvas_flow.py` browser session signs into the student account, captures each Grades page, and stores structured assignment rows plus the displayed course total. Weekly assignment cards are created only from that student scrape. Matching OL_Account records may add week/date metadata, but they cannot add assignment rows absent from the student Grades page. If no completed student scrape is available, the report displays a capture-needed message instead of substituting OL_Account assignments. The same secondary-account flow also treats the BA 300 and BA 315 landing-page schedule tables as the source of truth for dated preclass preparation and in-class activities; these rows are stored separately and rendered under **Class Preparation**.
 
 Legacy account/profile artifacts may still exist under an ignored local `data/` directory from older versions. They are not read by the current code, are not part of the architecture, and are never packaged into output.
 

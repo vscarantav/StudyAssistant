@@ -23,7 +23,7 @@ with tempfile.TemporaryDirectory() as td:
    context.route('**/*',lambda route:route.continue_() if route.request.url.startswith(base) or route.request.url.startswith('file:') else route.abort())
    page=context.new_page();errors=[];page.on('pageerror',lambda err:errors.append(str(err)))
    page.goto(base+'/course_plans/index.html');page.get_by_text('Connected ·',exact=False).wait_for()
-   assert page.locator('[data-course-progress]').count()==5
+   assert page.locator('[data-course-progress]').count()==6
    page.screenshot(path='/tmp/learning-dashboard.png',full_page=True)
    page.goto(base+'/course_plans/431292/concepts/workflow.html')
    with page.expect_response(lambda r:r.url.endswith('/api/progress') and r.request.method=='POST'):
